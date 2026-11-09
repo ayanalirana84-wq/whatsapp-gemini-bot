@@ -1,100 +1,90 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
-const qrcode = require('qrcode-terminal');
 const axios = require('axios');
 const express = require('express');
-require('dotenv').config();
+const pino = require('pino');
 
-// 1. Express Server to keep Render active 24/7
+// Express health-check server to keep Render awake
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 app.get('/', (req, res) => {
-    res.send('WhatsApp Gemini Bot is active and running!');
+  res.send('WhatsApp Gemini Bot is running!');
 });
 
 app.listen(PORT, () => {
-    console.log(`Health check server running on port ${PORT}`);
+  console.log(`Health check server running on port ${PORT}`);
 });
 
-// 2. WhatsApp Bot Logic with Baileys & Gemini API
-async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+async function startWhatsAppBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+
+  const sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    browser: ['Ubuntu', 'Chrome', '22.04.4']
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  // Pairing code logic if not registered/logged in
+  if (!sock.authState.creds.registered) {
+    const phoneNumber = "923147941846"; 
     
-    const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false
-    });
+    setTimeout(async () => {
+      try {
+        let code = await sock.requestPairingCode(phoneNumber);
+        code = code?.match(/.{1,4}/g)?.join("-") || code;
+        console.log(`\n========================================`);
+        console.log(`YOUR WHATSAPP PAIRING CODE: ${code}`);
+        console.log(`========================================\n`);
+      } catch (err) {
+        console.error("Error requesting pairing code:", err);
+      }
+    }, 3000);
+  }
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        if (qr) {
-            console.log('--- SCAN THIS QR CODE WITH WHATSAPP ---');
-            qrcode.generate(qr, { small: true });
-        }
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Connection closed. Reconnecting...', shouldReconnect);
-            if (shouldReconnect) {
-                connectToWhatsApp();
-            } else {
-                console.log('Client logged out. Delete auth_info_baileys and restart.');
-            }
-        } else if (connection === 'open') {
-            console.log('WhatsApp Bot is connected successfully with Gemini!');
-        }
-    });
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
+      if (shouldReconnect) {
+        startWhatsAppBot();
+      }
+    } else if (connection === 'open') {
+      console.log('Bot successfully connected to WhatsApp!');
+    }
+  });
 
-    sock.ev.on('creds.update', saveCreds);
+  // Handle incoming messages & Gemini AI integration
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    const msg = messages[0];
+    if (!msg.message || msg.key.fromMe) return;
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const m = messages[0];
-        if (!m.message || m.key.fromMe) return;
+    const sender = msg.key.remoteJid;
+    const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
-        const messageType = Object.keys(m.message)[0];
-        let text = '';
-        if (messageType === 'conversation') {
-            text = m.message.conversation;
-        } else if (messageType === 'extendedTextMessage') {
-            text = m.message.extendedTextMessage.text;
-        }
+    if (!textMessage) return;
 
-        // Bot Trigger: Message must start with "!ai "
-        if (text && text.startsWith('!ai ')) {
-            const userPrompt = text.replace('!ai ', '').trim();
-            const senderID = m.key.remoteJid;
+    console.log(`Received message from ${sender}: ${textMessage}`);
 
-            console.log(`Received prompt: ${userPrompt}`);
+    try {
+      const response = await axios.post(GEMINI_URL, {
+        contents: [{ parts: [{ text: textMessage }] }]
+      });
 
-            try {
-                // Gemini API Request
-                const response = await axios.post(
-                    'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent',
-                    {
-                        contents: [
-                            {
-                                parts: [
-                                    { text: userPrompt }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-goog-api-key': process.env.GEMINI_API_KEY
-                        }
-                    }
-                );
+      const replyText = response.data.candidates[0].content.parts[0].text;
 
-                const aiReply = response.data.candidates[0].content.parts[0].text;
-                await sock.sendMessage(senderID, { text: aiReply }, { quoted: m });
-            } catch (error) {
-                console.error('Gemini API Error:', error?.response?.data || error.message);
-                await sock.sendMessage(senderID, { text: 'Sorry, AI response error occurred.' }, { quoted: m });
-            }
-        }
-    });
+      await sock.sendMessage(sender, { text: replyText });
+    } catch (error) {
+      console.error('Error communicating with Gemini API:', error);
+      await sock.sendMessage(sender, { text: 'Sorry, I encountered an error processing your request.' });
+    }
+  });
 }
 
-connectToWhatsApp();
+startWhatsAppBot();
