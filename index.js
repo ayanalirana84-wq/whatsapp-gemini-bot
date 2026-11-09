@@ -2,6 +2,7 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = requi
 const axios = require('axios');
 const express = require('express');
 const pino = require('pino');
+const readline = require('readline');
 
 // Express health-check server to keep Render awake
 const app = express();
@@ -29,21 +30,23 @@ async function startWhatsAppBot() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Pairing code logic if not registered/logged in
+  // Pairing code logic with a fresh timer so you have enough time
   if (!sock.authState.creds.registered) {
     const phoneNumber = "923147941846"; 
     
+    // 10 seconds ka delay taake server poori tarah ready ho jaye aur aapke paas time ho
     setTimeout(async () => {
       try {
+        console.log("\nRequesting fresh pairing code...");
         let code = await sock.requestPairingCode(phoneNumber);
         code = code?.match(/.{1,4}/g)?.join("-") || code;
         console.log(`\n========================================`);
-        console.log(`YOUR WHATSAPP PAIRING CODE: ${code}`);
+        console.log(`YOUR FRESH WHATSAPP PAIRING CODE: ${code}`);
         console.log(`========================================\n`);
       } catch (err) {
         console.error("Error requesting pairing code:", err);
       }
-    }, 3000);
+    }, 10000);
   }
 
   sock.ev.on('connection.update', (update) => {
